@@ -64,6 +64,35 @@ export async function errorFromResponse(
   );
 }
 
+
+/**
+ * Lifts an error thrown while a streamed answer is being read into the AI SDK
+ * error type. A failed stream resume raises the core error from inside the
+ * response body, past the try/catch around the call that produced it.
+ */
+function mapStreamErrors(
+  body: ReadableStream<Uint8Array>
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        controller.error(toAISDKError(error));
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+}
+
 /**
  * Builds the transport for a set of provider settings, with every failure
  * lifted into the AI SDK error type.
@@ -82,11 +111,17 @@ export function createTransport(settings: AISettings): Transport {
       }
     },
     async run(request) {
+      let response: Response;
       try {
-        return await inner.run(request);
+        response = await inner.run(request);
       } catch (error) {
         throw toAISDKError(error);
       }
+      // A streamed `/run` answer can fail after the response is handed out,
+      // when the stream drops and resuming it fails: the error surfaces on a
+      // later read, not at the await above.
+      if (response.body === null) return response;
+      return new Response(mapStreamErrors(response.body), response);
     },
     url: inner.url
   };
